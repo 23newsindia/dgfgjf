@@ -12,15 +12,25 @@ class BotBlackhole {
     private $whitelisted_ips_cache = null;
     private $table_name;
     private static $is_admin = null;
+    private static $is_logged_in = null;
     private $whitelist_cache = null;
+    private static $current_user_can_manage = null;
     
     public function __construct() {
         global $wpdb;
         $this->table_name = $wpdb->prefix . 'security_blocked_bots';
         
-        // Initialize is_admin check once
+        // Initialize static checks once for performance
         if (self::$is_admin === null) {
             self::$is_admin = is_admin();
+        }
+        
+        if (self::$is_logged_in === null) {
+            self::$is_logged_in = is_user_logged_in();
+        }
+        
+        if (self::$current_user_can_manage === null) {
+            self::$current_user_can_manage = current_user_can('manage_options');
         }
         
         // Always ensure table exists and is up to date
@@ -40,18 +50,14 @@ class BotBlackhole {
     }
     
     private function init() {
-        // Only add frontend hooks if not in admin
-        if (!self::$is_admin) {
+        // Only add frontend hooks if not in admin and not logged in as admin
+        if (!self::$is_admin && !self::$current_user_can_manage) {
             // Create blackhole trap
             add_action('wp_footer', array($this, 'add_blackhole_trap'));
             add_action('login_footer', array($this, 'add_blackhole_trap'));
             
             // Check for bot access - highest priority
             add_action('init', array($this, 'check_bot_access'), 1);
-            
-            // ENHANCED: Capture ALL traffic for monitoring
-            add_action('wp', array($this, 'capture_live_traffic'), 1);
-            add_action('login_init', array($this, 'capture_live_traffic'), 1);
         }
         
         // Add to robots.txt
@@ -65,30 +71,16 @@ class BotBlackhole {
         add_action('admin_init', array($this, 'schedule_cleanup'));
         add_action('bot_blackhole_cleanup', array($this, 'cleanup_logs'));
         
-        // ENHANCED: Add debug logging
-        if (defined('WP_DEBUG') && WP_DEBUG) {
-            add_action('wp_footer', array($this, 'debug_traffic_info'));
+        // Add live traffic capture (only for non-admin users)
+        if (!self::$is_admin && !self::$current_user_can_manage) {
+            add_action('wp', array($this, 'capture_live_traffic'), 1);
         }
-    }
-    
-    // ENHANCED: Debug information for traffic monitoring
-    public function debug_traffic_info() {
-        if (!current_user_can('manage_options')) {
-            return;
-        }
-        
-        global $wpdb;
-        $total_traffic = $wpdb->get_var("SELECT COUNT(*) FROM {$this->table_name}");
-        $blocked_count = $wpdb->get_var("SELECT COUNT(*) FROM {$this->table_name} WHERE is_blocked = 1");
-        $monitoring_count = $wpdb->get_var("SELECT COUNT(*) FROM {$this->table_name} WHERE is_blocked = 0");
-        
-        echo "<!-- Bot Protection Debug: Total Traffic: {$total_traffic}, Blocked: {$blocked_count}, Monitoring: {$monitoring_count} -->";
     }
     
     public function capture_live_traffic() {
-        // Skip for admin users and logged-in users if configured
-        if (current_user_can('manage_options') || 
-            (is_user_logged_in() && $this->get_option('security_bot_skip_logged_users', true))) {
+        // CRITICAL: Skip for admin users and logged-in users if configured
+        if (self::$current_user_can_manage || 
+            (self::$is_logged_in && $this->get_option('security_bot_skip_logged_users', true))) {
             return;
         }
         
@@ -96,53 +88,13 @@ class BotBlackhole {
         $user_agent = $this->get_user_agent();
         $request_uri = $_SERVER['REQUEST_URI'];
         
-        // ENHANCED: More detailed traffic classification
-        $traffic_type = $this->classify_traffic($user_agent, $request_uri);
-        
-        // Log all traffic for monitoring with enhanced classification
-        $this->log_traffic($ip, $user_agent, $request_uri, $traffic_type);
-        
-        // ENHANCED: Debug logging for admins
-        if (defined('WP_DEBUG') && WP_DEBUG && current_user_can('manage_options')) {
-            error_log("Bot Protection: Captured traffic from {$ip} - {$traffic_type}");
-        }
-    }
-    
-    // ENHANCED: Classify traffic types for better monitoring
-    private function classify_traffic($user_agent, $request_uri) {
-        $ua_lower = strtolower($user_agent);
-        
-        // Known good bots
-        $good_bots = array('googlebot', 'bingbot', 'slurp', 'duckduckbot', 'facebookexternalhit');
-        foreach ($good_bots as $bot) {
-            if (strpos($ua_lower, $bot) !== false) {
-                return 'Good Bot: ' . ucfirst($bot);
-            }
+        // Skip WooCommerce AJAX requests for logged-in users
+        if (self::$is_logged_in && strpos($request_uri, 'wc-ajax=') !== false) {
+            return;
         }
         
-        // Suspicious patterns
-        $suspicious_patterns = array('bot', 'crawler', 'spider', 'scraper', 'curl', 'wget');
-        foreach ($suspicious_patterns as $pattern) {
-            if (strpos($ua_lower, $pattern) !== false) {
-                return 'Suspicious Bot: ' . $pattern;
-            }
-        }
-        
-        // Browser patterns
-        if (preg_match('/mozilla.*chrome.*safari/i', $user_agent)) {
-            return 'Browser: Chrome';
-        } elseif (preg_match('/mozilla.*firefox/i', $user_agent)) {
-            return 'Browser: Firefox';
-        } elseif (preg_match('/mozilla.*safari/i', $user_agent)) {
-            return 'Browser: Safari';
-        }
-        
-        // Empty or minimal user agent
-        if (empty($user_agent) || strlen($user_agent) < 10) {
-            return 'Suspicious: Empty/Minimal UA';
-        }
-        
-        return 'Unknown Traffic';
+        // Log all traffic for monitoring
+        $this->log_traffic($ip, $user_agent, $request_uri, 'Live Traffic');
     }
     
     private function log_traffic($ip, $user_agent, $request_uri, $reason) {
@@ -165,11 +117,10 @@ class BotBlackhole {
                     array(
                         'hits' => $existing->hits + 1, 
                         'timestamp' => current_time('mysql'),
-                        'last_seen' => current_time('mysql'),
-                        'blocked_reason' => $reason // Update with latest classification
+                        'last_seen' => current_time('mysql')
                     ),
                     array('id' => $existing->id),
-                    array('%d', '%s', '%s', '%s'),
+                    array('%d', '%s', '%s'),
                     array('%d')
                 );
             } else {
@@ -191,11 +142,6 @@ class BotBlackhole {
                     ),
                     array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d')
                 );
-                
-                // ENHANCED: Log new visitor detection
-                if (defined('WP_DEBUG') && WP_DEBUG) {
-                    error_log("Bot Protection: New visitor detected - IP: {$ip}, Type: {$reason}");
-                }
             }
         } catch (Exception $e) {
             error_log('Bot Blackhole Traffic Log Error: ' . $e->getMessage());
@@ -285,7 +231,7 @@ class BotBlackhole {
     
     public function add_blackhole_trap() {
         // Don't show trap to logged-in users or admins
-        if (is_user_logged_in() || current_user_can('manage_options')) {
+        if (self::$is_logged_in || self::$current_user_can_manage) {
             return;
         }
         
@@ -310,8 +256,8 @@ class BotBlackhole {
     }
     
     public function check_bot_access() {
-        // CRITICAL: Skip all checks for logged-in users and admins
-        if (is_user_logged_in() || current_user_can('manage_options')) {
+        // CRITICAL: Skip all checks for logged-in users and admins - FIRST CHECK
+        if (self::$is_logged_in || self::$current_user_can_manage) {
             return;
         }
         
@@ -330,6 +276,16 @@ class BotBlackhole {
         
         // Enhanced whitelist check - FIRST priority
         if ($this->is_whitelisted($ip, $user_agent, $request_uri)) {
+            return;
+        }
+        
+        // Skip WooCommerce AJAX requests completely
+        if (strpos($request_uri, 'wc-ajax=') !== false) {
+            return;
+        }
+        
+        // Skip WordPress AJAX requests
+        if (strpos($request_uri, '/wp-admin/admin-ajax.php') !== false) {
             return;
         }
         
@@ -463,11 +419,13 @@ class BotBlackhole {
             '/wp-content/',
             '/wp-login.php',
             '/wp-cron.php',
-            '/xmlrpc.php'
+            '/xmlrpc.php',
+            'wc-ajax=',
+            'admin-ajax.php'
         );
         
         foreach ($core_paths as $path) {
-            if (strpos($request_uri, $path) === 0) {
+            if (strpos($request_uri, $path) !== false) {
                 return true;
             }
         }
@@ -527,6 +485,11 @@ class BotBlackhole {
     private function analyze_request_pattern($request_uri) {
         $score = 0;
         
+        // Skip WooCommerce AJAX requests
+        if (strpos($request_uri, 'wc-ajax=') !== false) {
+            return 0;
+        }
+        
         // Suspicious request patterns
         $suspicious_patterns = array(
             '/wp-config', '/xmlrpc', '/.env', '/phpmyadmin',
@@ -540,10 +503,10 @@ class BotBlackhole {
             }
         }
         
-        // Multiple consecutive requests (rate limiting)
+        // Multiple consecutive requests (rate limiting) - but be more lenient
         $ip = $this->get_client_ip();
         $request_count = get_transient('bot_requests_' . md5($ip));
-        if ($request_count && $request_count > 10) {
+        if ($request_count && $request_count > 50) { // Increased from 10 to 50
             $score += 30;
         }
         
@@ -588,23 +551,46 @@ class BotBlackhole {
         global $wpdb;
         
         try {
-            $wpdb->insert(
-                $this->table_name,
-                array(
-                    'ip_address' => $ip,
-                    'user_agent' => $user_agent,
-                    'request_uri' => $request_uri,
-                    'referrer' => isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '',
-                    'timestamp' => current_time('mysql'),
-                    'first_seen' => current_time('mysql'),
-                    'last_seen' => current_time('mysql'),
-                    'block_reason' => $reason,
-                    'blocked_reason' => $reason,
-                    'is_blocked' => 0,
-                    'hits' => 1
-                ),
-                array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d')
-            );
+            // Check if this IP already exists
+            $existing = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$this->table_name} WHERE ip_address = %s",
+                $ip
+            ));
+            
+            if ($existing) {
+                // Update existing record
+                $wpdb->update(
+                    $this->table_name,
+                    array(
+                        'hits' => $existing->hits + 1,
+                        'last_seen' => current_time('mysql'),
+                        'request_uri' => $request_uri,
+                        'blocked_reason' => $reason
+                    ),
+                    array('ip_address' => $ip),
+                    array('%d', '%s', '%s', '%s'),
+                    array('%s')
+                );
+            } else {
+                // Insert new record
+                $wpdb->insert(
+                    $this->table_name,
+                    array(
+                        'ip_address' => $ip,
+                        'user_agent' => $user_agent,
+                        'request_uri' => $request_uri,
+                        'referrer' => isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '',
+                        'timestamp' => current_time('mysql'),
+                        'first_seen' => current_time('mysql'),
+                        'last_seen' => current_time('mysql'),
+                        'block_reason' => $reason,
+                        'blocked_reason' => $reason,
+                        'is_blocked' => 0,
+                        'hits' => 1
+                    ),
+                    array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d')
+                );
+            }
         } catch (Exception $e) {
             error_log('Bot Blackhole Log Error: ' . $e->getMessage());
         }
@@ -612,7 +598,7 @@ class BotBlackhole {
     
     private function trap_bot($ip, $user_agent, $reason) {
         // Final safety check - never block admins or logged-in users
-        if (is_user_logged_in() || current_user_can('manage_options')) {
+        if (self::$is_logged_in || self::$current_user_can_manage) {
             return;
         }
         
